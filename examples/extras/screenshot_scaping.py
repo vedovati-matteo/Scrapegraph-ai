@@ -1,32 +1,25 @@
+""" 
+Basic example of scraping pipeline using SmartScraper
 """
-example of scraping with screenshots
-"""
-import asyncio
-from scrapegraphai.utils.screenshot_scraping import (take_screenshot,
-                                                     select_area_with_opencv,
-                                                     crop_image, detect_text)
 
-# STEP 1: Take a screenshot
-image = asyncio.run(take_screenshot(
-    url="https://colab.google/",
-    save_path="Savedscreenshots/test_image.jpeg",
-    quality = 50
-))
+import json
+from scrapegraphai.graphs import ScreenshotScraperGraph
+from scrapegraphai.utils import prettify_exec_info
 
-# STEP 2 (Optional): Select an area of the image which you want to use for text detection.
-LEFT, TOP, RIGHT, BOTTOM = select_area_with_opencv(image)
-print("LEFT: ", LEFT, " TOP: ", TOP, " RIGHT: ", RIGHT, " BOTTOM: ", BOTTOM)
+# ************************************************
+# Create the ScreenshotScraperGraph instance and run it
+# ************************************************
 
-# STEP 3 (Optional): Crop the image.
-# Note: If any of the coordinates (LEFT, TOP, RIGHT, BOTTOM) is None, 
-# it will be set to the corresponding edge of the image.
-cropped_image = crop_image(image, LEFT=LEFT, RIGHT=RIGHT,TOP=TOP,BOTTOM=BOTTOM)
-
-# STEP 4: Detect text
-TEXT = detect_text(
-    cropped_image,          # The image to detect text from
-    languages = ["en"]       # The languages to detect text in
+smart_scraper_graph = ScreenshotScraperGraph(
+    prompt="",
+    source="https://perinim.github.io/projects/",
+    config={"llm": {
+        "model": "ollama/llama3",
+        "temperature": 0,
+        "format": "json",  # Ollama needs the format to be specified explicitly
+        "model_tokens": 4000,
+    },}
 )
 
-print("DETECTED TEXT: ")
-print(TEXT)
+result = smart_scraper_graph.run()
+print(json.dumps(result, indent=4))

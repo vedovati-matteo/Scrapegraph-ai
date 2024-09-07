@@ -137,7 +137,7 @@ class AbstractGraph(ABC):
                 self.model_token = llm_params["model_tokens"]
             except KeyError as exc:
                 raise KeyError("model_tokens not specified") from exc
-            return llm_params["model_instance"]    
+            return llm_params["model_instance"]
 
         known_providers = {"openai", "azure_openai", "google_genai", "google_vertexai",
                         "ollama", "oneapi", "nvidia", "groq", "anthropic", "bedrock", "mistralai",

@@ -8,7 +8,7 @@ from .base_graph import BaseGraph
 from .abstract_graph import AbstractGraph
 from ..nodes import ( FetchScreenNode, GenerateAnswerFromImageNode, )
 
-class ScreenshotScraperGraph(AbstractGraph): 
+class ScreenshotScraperGraph(AbstractGraph):
     """ 
     A graph instance representing the web scraping workflow for images.
 
@@ -40,32 +40,53 @@ class ScreenshotScraperGraph(AbstractGraph):
         Returns:
             BaseGraph: A graph instance representing the web scraping workflow for images.
         """
-        fetch_screen_node = FetchScreenNode(
-            input="url",
-            output=["screenshots"],
-            node_config={
-                "link": self.source
-            }
-        )
-        generate_answer_from_image_node = GenerateAnswerFromImageNode(
-            input="screenshots",
-            output=["answer"],
-            node_config={
-                "config": self.config
-            }
-        )
+        if self.config["llm"]["model"].split("/")[0] == 'openai':
 
+            fetch_screen_node = FetchScreenNode(
+                input="url",
+                output=["screenshots"],
+                node_config={
+                    "link": self.source
+                }
+            )
+            generate_answer_from_image_node = GenerateAnswerFromImageNode(
+                input="screenshots",
+                output=["answer"],
+                node_config={
+                    "config": self.config
+                }
+            )
+
+            return BaseGraph(
+                nodes=[
+                    fetch_screen_node,
+                    generate_answer_from_image_node,
+                ],
+                edges=[
+                    (fetch_screen_node, generate_answer_from_image_node),
+                ],
+                entry_point=fetch_screen_node,
+                graph_name=self.__class__.__name__
+            )
+
+        from ..nodes.screenshot_manual_node import ScreenShotManualNode
+
+        screenshot_node = ScreenShotManualNode(
+                input="link",
+                output=["answer"],
+                node_config={
+                    "config": self.config
+                })
         return BaseGraph(
-            nodes=[
-                fetch_screen_node,
-                generate_answer_from_image_node,
-            ],
-            edges=[
-                (fetch_screen_node, generate_answer_from_image_node),
-            ],
-            entry_point=fetch_screen_node,
-            graph_name=self.__class__.__name__
-        )
+                nodes=[
+                    screenshot_node,
+                ],
+                edges=[
+                    (screenshot_node, screenshot_node),
+                ],
+                entry_point=screenshot_node,
+                graph_name=self.__class__.__name__
+            )
 
     def run(self) -> str:
         """

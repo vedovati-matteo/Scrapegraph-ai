@@ -51,49 +51,70 @@ class RAGNode(BaseNode):
         else:
             raise ValueError("client_type provided not correct")
 
-        docs = [elem.get("summary") for elem in state.get("docs")]
-        ids = [i for i in range(1, len(state.get("docs"))+1)]
+        docs = state.get("docs")
 
         if state.get("embeddings"):
-            import openai
-            openai_client = openai.Client()
-
-            files = state.get("documents")
-
-            array_of_embeddings = []
-            i=0
-
-            for file in files:
-                embeddings = openai_client.embeddings.create(input=file,
-                                                             model=state.get("embeddings").get("model"))
-                i+=1
-                points = PointStruct(
-                        id=i,
-                        vector=embeddings,
-                        payload={"text": file},
-                    )
-
-                array_of_embeddings.append(points)
-
             collection_name = "collection"
-
+            vector_size = 1536
+            
             client.create_collection(
                 collection_name,
                 vectors_config=VectorParams(
-                    size=1536,
+                    size=vector_size,
                     distance=Distance.COSINE,
                 ),
             )
-            client.upsert(collection_name, points)
+            
+            import openai
+            openai_client = openai.Client()
 
+            # Prepare and insert data
+            points = []
+
+            for idx, doc in enumerate(docs):
+                # Encode summary
+                #summary_embedding = encoder.encode(doc["summary"]).tolist()
+                summary_embedding = openai_client.embeddings.create(input=doc["summary"],
+                                                             model=state.get("embeddings").get("model"))
+                
+                # Create point
+                point = PointStruct(
+                    id=idx,
+                    vector={"summary_vector": summary_embedding},
+                    payload={
+                        "summary": doc["summary"],
+                        "document": doc["document"],
+                        "metadata": doc["metadata"]
+                    }
+                )
+                points.append(point)
+
+            # Insert points into collection
+            client.upsert(
+                collection_name=collection_name,
+                points=points
+            )
+            
             state["vectorial_db"] = client
             return state
 
-        client.add(
-            collection_name="vectorial_collection",
-            documents=docs,
-            ids=ids
-        )
+        for idx, doc in enumerate(docs):
+            # Create point
+            point = PointStruct(
+                id=idx,
+                payload={
+                    "summary": doc["summary"],
+                    "document": doc["document"],
+                    "metadata": doc["metadata"]
+                }
+            )
+            points.append(point)
 
+        # Insert points into collection
+        client.upsert(
+            collection_name=collection_name,
+            points=points
+        )
+        
         state["vectorial_db"] = client
         return state

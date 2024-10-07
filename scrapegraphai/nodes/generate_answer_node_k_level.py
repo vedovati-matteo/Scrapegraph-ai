@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableParallel
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_mistralai import ChatMistralAI
 from langchain_aws import ChatBedrock
+from qdrant_client import models
 from ..utils.output_parser import get_structured_output_parser, get_pydantic_output_parser
 from .base_node import BaseNode
 from ..prompts import (
@@ -148,3 +149,96 @@ class GenerateAnswerNodeKLevel(BaseNode):
         state["answer"] = answer
 
         return state
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_vector: List[float],
+        client,
+        collection_name,
+        threshold=0.7,  # Adjust this threshold based on your needs
+        summary_weight=0.7,  # Weight for summary relevance (0.0 to 1.0)
+        document_weight=0.3  # Weight for document relevance (0.0 to 1.0)
+    ):
+        """
+        Perform a hybrid search using a single query string with threshold and weighted scoring.
+        
+        Parameters:
+        - query: str, the user's search query
+        - threshold: float, minimum score for results (0.0 to 1.0)
+        - summary_weight: float, weight for summary relevance (0.0 to 1.0)
+        - document_weight: float, weight for document relevance (0.0 to 1.0)
+        """
+        # 1. Vector search on summaries
+        vector_results = client.search(
+            collection_name=collection_name,
+            query_vector={"summary_vector": query_vector},
+            search_params=models.SearchParams(
+                hnsw_ef=128,
+                exact=False
+            ),
+            limit=100,  # High limit to get all potential matches
+            score_threshold=threshold * 0.8,  # Slightly lower threshold for initial fetch
+            with_payload=True,
+        )
+        
+        # 2. Text search on documents
+        text_results = client.search(
+            collection_name=collection_name,
+            query_filter=models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="document",
+                        match=models.MatchText(text=query)
+                    ),
+                    models.FieldCondition(
+                        key="summary",
+                        match=models.MatchText(text=query)
+                    )
+                ]
+            ),
+            limit=100,  # High limit to get all potential matches
+            with_payload=True,
+        )
+        
+        # Combine and weight results
+        combined_results = {}
+        
+        # Process vector results (summary matches)
+        for result in vector_results:
+            combined_results[result.id] = {
+                'point_id': result.id,
+                'payload': result.payload,
+                'summary_score': result.score * summary_weight,
+                'document_score': 0
+            }
+        
+        # Process text results (document matches)
+        for result in text_results:
+            if result.id in combined_results:
+                combined_results[result.id]['document_score'] = result.score * document_weight
+            else:
+                combined_results[result.id] = {
+                    'point_id': result.id,
+                    'payload': result.payload,
+                    'summary_score': 0,
+                    'document_score': result.score * document_weight
+                }
+        
+        # Calculate final scores and filter by threshold
+        final_results = []
+        for result_data in combined_results.values():
+            final_score = result_data['summary_score'] + result_data['document_score']
+            if final_score >= threshold:
+                final_results.append({
+                    'id': result_data['point_id'],
+                    'score': final_score,
+                    'payload': result_data['payload'],
+                    'summary_score': result_data['summary_score'] / summary_weight,
+                    'document_score': result_data['document_score'] / document_weight
+                })
+        
+        # Sort by final score
+        final_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        return final_results

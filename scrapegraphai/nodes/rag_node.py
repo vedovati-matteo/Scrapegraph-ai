@@ -42,6 +42,7 @@ class RAGNode(BaseNode):
     def execute(self, state: dict) -> dict:
         self.logger.info(f"--- Executing {self.node_name} Node ---")
         
+        # Initialize client based on config
         if self.node_config.get("client_type") in ["memory", None]:
             client = QdrantClient(":memory:")
         elif self.node_config.get("client_type") == "local_db":
@@ -51,49 +52,105 @@ class RAGNode(BaseNode):
         else:
             raise ValueError("client_type provided not correct")
 
-        docs = [elem.get("summary") for elem in state.get("docs")]
-        ids = [i for i in range(1, len(state.get("docs"))+1)]
+        docs = state.get("docs")
+        collection_name = "collection"
+        points = []
 
-        if state.get("embeddings"):
-            import openai
-            openai_client = openai.Client()
-
-            files = state.get("documents")
-
-            array_of_embeddings = []
-            i=0
-
-            for file in files:
-                embeddings = openai_client.embeddings.create(input=file,
-                                                             model=state.get("embeddings").get("model"))
-                i+=1
-                points = PointStruct(
-                        id=i,
-                        vector=embeddings,
-                        payload={"text": file},
-                    )
-
-                array_of_embeddings.append(points)
-
-            collection_name = "collection"
-
+        # Handle case with embeddings
+        if self.embedder_model:
             client.create_collection(
                 collection_name,
                 vectors_config=VectorParams(
-                    size=1536,
+                    size=vector_size,
                     distance=Distance.COSINE,
                 ),
             )
-            client.upsert(collection_name, points)
+            
+            if self.embedder_model.get("source") == "openai":
+                import openai
+                openai_client = openai.Client()
+            
+                vector_size = 1536
 
-            state["vectorial_db"] = client
-            return state
+                for idx, doc in enumerate(docs):
+                    # Generate embedding for summary
+                    summary_embedding = openai_client.embeddings.create(
+                        input=doc["summary"],
+                        model=self.embedder_model.get("model")
+                    ).data[0].embedding
+                    
+                    # Create point with vector
+                    point = PointStruct(
+                        id=idx,
+                        vector=summary_embedding,
+                        payload={
+                            "summary": doc["summary"],
+                            "document": doc["document"],
+                            "metadata": doc["metadata"]
+                        }
+                    )
+                    points.append(point)
+            
+            elif self.embedder_model.get("source") == "huggingface":
+                from transformers import AutoModel, AutoTokenizer
+                import torch
+                
+                # Load Hugging Face model and tokenizer
+                model_name = self.embedder_model.get("model")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModel.from_pretrained(model_name)
+                
+                vector_size = model.config.hidden_size
 
-        client.add(
-            collection_name="vectorial_collection",
-            documents=docs,
-            ids=ids
+                for idx, doc in enumerate(docs):
+                    # Tokenize and generate embedding for summary
+                    inputs = tokenizer(doc["summary"], return_tensors="pt", padding=True, truncation=True)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                    
+                    # Take the mean of token embeddings to create a single vector for the document
+                    summary_embedding = torch.mean(outputs.last_hidden_state, dim=1).squeeze().tolist()
+
+                    # Create point with vector
+                    point = PointStruct(
+                        id=idx,
+                        vector=summary_embedding,
+                        payload={
+                            "summary": doc["summary"],
+                            "document": doc["document"],
+                            "metadata": doc["metadata"]
+                        }
+                    )
+                    points.append(point)
+            
+            else:
+                raise ValueError("Embedder model source not supported")
+            
+        # Handle case without embeddings
+        else:
+            # Create collection without vector configuration
+            client.create_collection(
+                collection_name,
+                vectors_config=None
+            )
+            
+            for idx, doc in enumerate(docs):
+                # Create point without vector
+                point = PointStruct(
+                    id=idx,
+                    payload={
+                        "summary": doc["summary"],
+                        "document": doc["document"],
+                        "metadata": doc["metadata"]
+                    }
+                )
+                points.append(point)
+        
+        # Insert points into collection
+        client.upsert(
+            collection_name=collection_name,
+            points=points
         )
-
+        
         state["vectorial_db"] = client
         return state

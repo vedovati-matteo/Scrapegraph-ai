@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableParallel
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_mistralai import ChatMistralAI
 from langchain_aws import ChatBedrock
+from qdrant_client import models
 from ..utils.output_parser import get_structured_output_parser, get_pydantic_output_parser
 from .base_node import BaseNode
 from ..prompts import (
@@ -97,43 +98,43 @@ class GenerateAnswerNodeKLevel(BaseNode):
 
         client = state["vectorial_db"]
 
-        if state.get("embeddings"):
-            import openai
-            openai_client = openai.Client()
-
-            answer_db = client.search(
-            collection_name="collection",
-            query_vector=openai_client.embeddings.create(
-                input=["What is the best to use for vector search scaling?"],
-                model=state.get("embeddings").get("model"),
-            )
-            .data[0]
-            .embedding,
+        search_results = self.hybrid_search(
+            query=user_prompt,
+            client=client,
+            collection_name="vectorial_collection",
+            threshold=0.5,
+            summary_weight=0.7,
+            document_weight=0.3
         )
-        else:
-            answer_db = client.query(
-                collection_name="vectorial_collection",
-                query_text=user_prompt
-            )
 
+        if not search_results:
+            state["answer"] = "No results found."
+            return state
+        
         chains_dict = {}
-        elems =[state.get("docs")[elem.id-1] for elem in answer_db if elem.score>0.5]
-
-        for i, chunk in enumerate(tqdm(elems,
-                                       desc="Processing chunks", disable=not self.verbose)):
+        
+        # Process each search result in parallel
+        for i, result in enumerate(tqdm(search_results, 
+                                   desc="Setting up chunk processing", 
+                                   disable=not self.verbose)):
+            # Create a prompt for each search result
             prompt = PromptTemplate(
-                        template=template_chunks_prompt,
-                        input_variables=["format_instructions"],
-                        partial_variables={"context": chunk.get("document"),
-                                        "chunk_id": i + 1,
-                                     }
-                )
+                template=template_chunks_prompt,
+                input_variables=["format_instructions"],
+                partial_variables={
+                    "context": result['payload']['document'],
+                    "chunk_id": i + 1
+                }
+            )
+            
             chain_name = f"chunk{i+1}"
             chains_dict[chain_name] = prompt | self.llm_model
-
+        
+        # Execute all chains in parallel
         async_runner = RunnableParallel(**chains_dict)
         batch_results = async_runner.invoke({"format_instructions": user_prompt})
 
+        # Create and execute merge prompt
         merge_prompt = PromptTemplate(
             template=template_merge_prompt,
             input_variables=["context", "question"],
@@ -143,8 +144,149 @@ class GenerateAnswerNodeKLevel(BaseNode):
         merge_chain = merge_prompt | self.llm_model
         if output_parser:
             merge_chain = merge_chain | output_parser
-        answer = merge_chain.invoke({"context": batch_results, "question": user_prompt})
+        answer = merge_chain.invoke({
+            "context": batch_results,
+            "question": user_prompt
+        })
 
-        state["answer"] = answer
+        return answer
 
-        return state
+    def hybrid_search(
+        self,
+        query: str,
+        client,
+        collection_name,
+        threshold=0.7,  # Adjust this threshold based on your needs
+        summary_weight=0.7,  # Weight for summary relevance (0.0 to 1.0)
+        document_weight=0.3  # Weight for document relevance (0.0 to 1.0)
+    ):
+        """
+        Perform a hybrid search using a single query string with threshold and weighted scoring.
+        If embeddings are available, performs both vector and text search; otherwise, only text search.
+        
+        Parameters:
+        - query: str, the user's search query
+        - client: the database client to perform the search
+        - collection_name: str, the collection name to search in
+        - threshold: float, minimum score for results (0.0 to 1.0)
+        - summary_weight: float, weight for summary relevance (0.0 to 1.0)
+        - document_weight: float, weight for document relevance (0.0 to 1.0)
+        """
+        combined_results = {}
+        
+        # 1. Vector search on summaries (if embeddings are available)
+        if self.embedder_model is not None:
+            if self.embedder_model.get("source") == "openai":
+                import openai
+                openai_client = openai.Client()
+
+                query_vector=openai_client.embeddings.create(
+                    input=query,
+                    model=self.embedder_model.get("model"),
+                )
+            
+            elif self.embedder_model.get("source") == "huggingface":
+                from transformers import AutoModel, AutoTokenizer
+                import torch
+                
+                # Load Hugging Face model and tokenizer
+                model_name = self.embedder_model.get("model")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModel.from_pretrained(model_name)
+                
+                # Tokenize and generate embedding for summary
+                inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                
+                # Take the mean of token embeddings to create a single vector for the document
+                query_vector = torch.mean(outputs.last_hidden_state, dim=1).squeeze().tolist()
+            
+            else:
+                raise ValueError("Invalid embedder source")
+            
+            vector_results = client.search(
+                collection_name=collection_name,
+                query_vector={"summary_vector": query_vector},
+                search_params=models.SearchParams(
+                    hnsw_ef=128,
+                    exact=False
+                ),
+                limit=100,  # High limit to get all potential matches
+                score_threshold=threshold * 0.8,  # Slightly lower threshold for initial fetch
+                with_payload=True,
+            )
+
+            # Process vector results
+            for result in vector_results:
+                combined_results[result.id] = {
+                    'point_id': result.id,
+                    'payload': result.payload,
+                    'summary_score': result.score * summary_weight,
+                    'document_score': 0
+                }
+            
+        # 2. Text search on documents
+        text_results = client.search(
+            collection_name=collection_name,
+            query_filter=models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="document",
+                        match=models.MatchText(text=query)
+                    ),
+                    models.FieldCondition(
+                        key="summary",
+                        match=models.MatchText(text=query)
+                    )
+                ]
+            ),
+            limit=100,  # High limit to get all potential matches
+            with_payload=True,
+        )
+        
+        # Process text search results and merge with vector results if available
+        for result in text_results:
+            if result.id in combined_results:
+                # Merge document score with existing summary score
+                combined_results[result.id]['document_score'] = result.score * document_weight
+            else:
+                # Add new result for cases without vector result
+                combined_results[result.id] = {
+                    'point_id': result.id,
+                    'payload': result.payload,
+                    'summary_score': 0,  # No vector score
+                    'document_score': result.score * document_weight
+                }
+        
+        # Adjust weights if no embeddings
+        if self.embedder_model is None:
+            # Use full weight for document score when no embeddings
+            for result_data in combined_results.values():
+                result_data['document_score'] /= document_weight  # Remove original weight
+                result_data['document_score'] *= 1.0  # Apply full weight
+        
+        # 3. Calculate final scores and filter by threshold
+        final_results = []
+        for result_data in combined_results.values():
+            final_score = result_data['summary_score'] + result_data['document_score']
+            if final_score >= threshold:
+                result_entry = {
+                    'id': result_data['point_id'],
+                    'score': final_score,
+                    'payload': result_data['payload'],
+                }
+                
+                # Add separate scores only if embeddings were used
+                if self.embedder_model is not None:
+                    result_entry.update({
+                        'summary_score': result_data['summary_score'] / summary_weight,
+                        'document_score': result_data['document_score'] / document_weight
+                    })
+                
+                final_results.append(result_entry)
+        
+        # Sort by final score
+        final_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        return final_results

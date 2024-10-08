@@ -42,6 +42,7 @@ class RAGNode(BaseNode):
     def execute(self, state: dict) -> dict:
         self.logger.info(f"--- Executing {self.node_name} Node ---")
         
+        # Initialize client based on config
         if self.node_config.get("client_type") in ["memory", None]:
             client = QdrantClient(":memory:")
         elif self.node_config.get("client_type") == "local_db":
@@ -52,9 +53,11 @@ class RAGNode(BaseNode):
             raise ValueError("client_type provided not correct")
 
         docs = state.get("docs")
+        collection_name = "collection"
+        points = []
 
+        # Handle case with embeddings
         if state.get("embeddings"):
-            collection_name = "collection"
             vector_size = 1536
             
             client.create_collection(
@@ -68,19 +71,17 @@ class RAGNode(BaseNode):
             import openai
             openai_client = openai.Client()
 
-            # Prepare and insert data
-            points = []
-
             for idx, doc in enumerate(docs):
-                # Encode summary
-                #summary_embedding = encoder.encode(doc["summary"]).tolist()
-                summary_embedding = openai_client.embeddings.create(input=doc["summary"],
-                                                             model=state.get("embeddings").get("model"))
+                # Generate embedding for summary
+                summary_embedding = openai_client.embeddings.create(
+                    input=doc["summary"],
+                    model=state.get("embeddings").get("model")
+                ).data[0].embedding
                 
-                # Create point
+                # Create point with vector
                 point = PointStruct(
                     id=idx,
-                    vector={"summary_vector": summary_embedding},
+                    vector=summary_embedding,
                     payload={
                         "summary": doc["summary"],
                         "document": doc["document"],
@@ -89,27 +90,26 @@ class RAGNode(BaseNode):
                 )
                 points.append(point)
 
-            # Insert points into collection
-            client.upsert(
-                collection_name=collection_name,
-                points=points
+        # Handle case without embeddings
+        else:
+            # Create collection without vector configuration
+            client.create_collection(
+                collection_name,
+                vectors_config=None
             )
             
-            state["vectorial_db"] = client
-            return state
-
-        for idx, doc in enumerate(docs):
-            # Create point
-            point = PointStruct(
-                id=idx,
-                payload={
-                    "summary": doc["summary"],
-                    "document": doc["document"],
-                    "metadata": doc["metadata"]
-                }
-            )
-            points.append(point)
-
+            for idx, doc in enumerate(docs):
+                # Create point without vector
+                point = PointStruct(
+                    id=idx,
+                    payload={
+                        "summary": doc["summary"],
+                        "document": doc["document"],
+                        "metadata": doc["metadata"]
+                    }
+                )
+                points.append(point)
+        
         # Insert points into collection
         client.upsert(
             collection_name=collection_name,

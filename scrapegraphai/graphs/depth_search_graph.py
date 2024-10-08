@@ -102,6 +102,7 @@ class DepthSearchGraph(AbstractGraph):
             node_config={
                 "llm_model": self.llm_model,
                 "embedder_model": self.config.get("embedder_model", False),
+                "client_type": self.config.get("client_type", None),
                 "verbose": self.config.get("verbose", False),
             }
         )

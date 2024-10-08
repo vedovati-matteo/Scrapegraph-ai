@@ -57,9 +57,7 @@ class RAGNode(BaseNode):
         points = []
 
         # Handle case with embeddings
-        if state.get("embeddings"):
-            vector_size = 1536
-            
+        if self.embedder_model:
             client.create_collection(
                 collection_name,
                 vectors_config=VectorParams(
@@ -68,28 +66,66 @@ class RAGNode(BaseNode):
                 ),
             )
             
-            import openai
-            openai_client = openai.Client()
+            if self.embedder_model.get("source") == "openai":
+                import openai
+                openai_client = openai.Client()
+            
+                vector_size = 1536
 
-            for idx, doc in enumerate(docs):
-                # Generate embedding for summary
-                summary_embedding = openai_client.embeddings.create(
-                    input=doc["summary"],
-                    model=state.get("embeddings").get("model")
-                ).data[0].embedding
+                for idx, doc in enumerate(docs):
+                    # Generate embedding for summary
+                    summary_embedding = openai_client.embeddings.create(
+                        input=doc["summary"],
+                        model=self.embedder_model.get("model")
+                    ).data[0].embedding
+                    
+                    # Create point with vector
+                    point = PointStruct(
+                        id=idx,
+                        vector=summary_embedding,
+                        payload={
+                            "summary": doc["summary"],
+                            "document": doc["document"],
+                            "metadata": doc["metadata"]
+                        }
+                    )
+                    points.append(point)
+            
+            elif self.embedder_model.get("source") == "huggingface":
+                from transformers import AutoModel, AutoTokenizer
+                import torch
                 
-                # Create point with vector
-                point = PointStruct(
-                    id=idx,
-                    vector=summary_embedding,
-                    payload={
-                        "summary": doc["summary"],
-                        "document": doc["document"],
-                        "metadata": doc["metadata"]
-                    }
-                )
-                points.append(point)
+                # Load Hugging Face model and tokenizer
+                model_name = self.embedder_model.get("model")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModel.from_pretrained(model_name)
+                
+                vector_size = model.config.hidden_size
 
+                for idx, doc in enumerate(docs):
+                    # Tokenize and generate embedding for summary
+                    inputs = tokenizer(doc["summary"], return_tensors="pt", padding=True, truncation=True)
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                    
+                    # Take the mean of token embeddings to create a single vector for the document
+                    summary_embedding = torch.mean(outputs.last_hidden_state, dim=1).squeeze().tolist()
+
+                    # Create point with vector
+                    point = PointStruct(
+                        id=idx,
+                        vector=summary_embedding,
+                        payload={
+                            "summary": doc["summary"],
+                            "document": doc["document"],
+                            "metadata": doc["metadata"]
+                        }
+                    )
+                    points.append(point)
+            
+            else:
+                raise ValueError("Embedder model source not supported")
+            
         # Handle case without embeddings
         else:
             # Create collection without vector configuration

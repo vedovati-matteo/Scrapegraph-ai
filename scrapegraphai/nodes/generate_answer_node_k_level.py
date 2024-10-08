@@ -99,7 +99,6 @@ class GenerateAnswerNodeKLevel(BaseNode):
         client = state["vectorial_db"]
 
         search_results = self.hybrid_search(
-            state=state,
             query=user_prompt,
             client=client,
             collection_name="vectorial_collection",
@@ -145,18 +144,15 @@ class GenerateAnswerNodeKLevel(BaseNode):
         merge_chain = merge_prompt | self.llm_model
         if output_parser:
             merge_chain = merge_chain | output_parser
-        answer = merge_chain.invoke({"context": batch_results, "question": user_prompt})
-
         answer = merge_chain.invoke({
-            "context": merged_context,
+            "context": batch_results,
             "question": user_prompt
         })
-        
+
         return answer
 
     def hybrid_search(
         self,
-        state,
         query: str,
         client,
         collection_name,
@@ -170,6 +166,8 @@ class GenerateAnswerNodeKLevel(BaseNode):
         
         Parameters:
         - query: str, the user's search query
+        - client: the database client to perform the search
+        - collection_name: str, the collection name to search in
         - threshold: float, minimum score for results (0.0 to 1.0)
         - summary_weight: float, weight for summary relevance (0.0 to 1.0)
         - document_weight: float, weight for document relevance (0.0 to 1.0)
@@ -177,15 +175,36 @@ class GenerateAnswerNodeKLevel(BaseNode):
         combined_results = {}
         
         # 1. Vector search on summaries (if embeddings are available)
-        if state.get("embeddings"):
-            import openai
-            openai_client = openai.Client()
+        if self.embedder_model is not None:
+            if self.embedder_model.get("source") == "openai":
+                import openai
+                openai_client = openai.Client()
 
-            query_vector=openai_client.embeddings.create(
-                input=query,
-                model=state.get("embeddings").get("model"),
-            )
-        
+                query_vector=openai_client.embeddings.create(
+                    input=query,
+                    model=self.embedder_model.get("model"),
+                )
+            
+            elif self.embedder_model.get("source") == "huggingface":
+                from transformers import AutoModel, AutoTokenizer
+                import torch
+                
+                # Load Hugging Face model and tokenizer
+                model_name = self.embedder_model.get("model")
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModel.from_pretrained(model_name)
+                
+                # Tokenize and generate embedding for summary
+                inputs = tokenizer(query, return_tensors="pt", padding=True, truncation=True)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                
+                # Take the mean of token embeddings to create a single vector for the document
+                query_vector = torch.mean(outputs.last_hidden_state, dim=1).squeeze().tolist()
+            
+            else:
+                raise ValueError("Invalid embedder source")
+            
             vector_results = client.search(
                 collection_name=collection_name,
                 query_vector={"summary_vector": query_vector},
@@ -226,14 +245,28 @@ class GenerateAnswerNodeKLevel(BaseNode):
             with_payload=True,
         )
         
+        # Process text search results and merge with vector results if available
+        for result in text_results:
+            if result.id in combined_results:
+                # Merge document score with existing summary score
+                combined_results[result.id]['document_score'] = result.score * document_weight
+            else:
+                # Add new result for cases without vector result
+                combined_results[result.id] = {
+                    'point_id': result.id,
+                    'payload': result.payload,
+                    'summary_score': 0,  # No vector score
+                    'document_score': result.score * document_weight
+                }
+        
         # Adjust weights if no embeddings
-        if not state.get("embeddings"):
+        if self.embedder_model is None:
             # Use full weight for document score when no embeddings
             for result_data in combined_results.values():
                 result_data['document_score'] /= document_weight  # Remove original weight
                 result_data['document_score'] *= 1.0  # Apply full weight
         
-        # Calculate final scores and filter by threshold
+        # 3. Calculate final scores and filter by threshold
         final_results = []
         for result_data in combined_results.values():
             final_score = result_data['summary_score'] + result_data['document_score']
@@ -245,7 +278,7 @@ class GenerateAnswerNodeKLevel(BaseNode):
                 }
                 
                 # Add separate scores only if embeddings were used
-                if state.get("embeddings"):
+                if self.embedder_model is not None:
                     result_entry.update({
                         'summary_score': result_data['summary_score'] / summary_weight,
                         'document_score': result_data['document_score'] / document_weight

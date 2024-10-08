@@ -14,6 +14,10 @@ graph_config = {
         "api_key": openai_key,
         "model": "openai/gpt-4o-mini",
     },
+    "embedder_model": {
+        "source": "openai",
+        "model": "text-embedding-ada-002",
+    },
     "verbose": True,
     "headless": False,
     "depth": 2,
